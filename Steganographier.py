@@ -519,6 +519,86 @@ def load_version(base_path):
     return version
 # ===========================
 
+# ==== 自动分卷（volume splitting）====
+VOLUME_SIZE_MARGIN_BYTES = 1 * 1024 * 1024  # 每卷固定余量：free 原子头/随机垫/zip 注释/中央目录估算误差
+MIN_VOLUME_CAP_BYTES = 16 * 1024 * 1024     # 每卷 zip 预算下限；也是切块件允许占用的最小空间单位
+
+
+def plan_volumes(entries, volume_budgets, chunk_min_bytes=MIN_VOLUME_CAP_BYTES,
+                 budget_offset=0, entry_overhead=None):
+    """把条目清单装进卷计划（纯函数，无 IO）。
+
+    entries: [(path, arcname, size), ...]，调用方按期望顺序传入（通常已打乱）。
+    volume_budgets: 各卷 zip 预算；按 (budget_offset + 卷序号) % len 周期取用。
+    entry_overhead: 单条目打包开销估算（默认按 arcname 长度估算；测试可注入 0）。
+    返回 {"volumes": [{"pieces": [...], "estimated_zip_size": int}, ...],
+          "chunked": {原始 arcname: [部件 arcname, ...]}}
+    """
+    if entry_overhead is None:
+        def entry_overhead(arcname):
+            return 256 + 2 * len(arcname.encode("utf-8"))
+
+    def budget_for(index):
+        return volume_budgets[(budget_offset + index) % len(volume_budgets)]
+
+    volumes = []
+    remaining = []   # 与 volumes 对齐的剩余预算
+    chunked = {}
+
+    def append_piece(piece, volume_index, cost):
+        while volume_index >= len(volumes):
+            volumes.append({"pieces": [], "estimated_zip_size": 0})
+            remaining.append(budget_for(len(volumes) - 1))
+        volumes[volume_index]["pieces"].append(piece)
+        volumes[volume_index]["estimated_zip_size"] += cost
+        remaining[volume_index] -= cost
+
+    for path, arcname, size in entries:
+        need = size + entry_overhead(arcname)
+        if not volumes:
+            volumes.append({"pieces": [], "estimated_zip_size": 0})
+            remaining.append(budget_for(0))
+        last = len(volumes) - 1
+
+        if need <= remaining[last]:
+            append_piece({"kind": "whole", "path": path, "arcname": arcname, "size": size}, last, need)
+            continue
+
+        # 当前卷装不下：仅当当前卷非空时允许"滚动整装"（否则会留下空卷）
+        if volumes[last]["pieces"] and need <= budget_for(len(volumes)):
+            append_piece({"kind": "whole", "path": path, "arcname": arcname, "size": size},
+                         len(volumes), need)
+            continue
+
+        # 单文件自身超限：按 .001 惯例切块跨卷；起始卷剩余不足下限则从新卷开始
+        start_index = last if remaining[last] >= chunk_min_bytes else len(volumes)
+        pieces = []
+        offset = 0
+        left = size
+        volume_index = start_index
+        while left > 0:
+            if volume_index >= len(volumes):
+                avail = budget_for(volume_index)
+            else:
+                avail = remaining[volume_index]
+            take = min(avail, left)
+            pieces.append((volume_index, offset, take))
+            offset += take
+            left -= take
+            volume_index += 1
+        digits = max(3, len(str(len(pieces))))
+        part_names = []
+        for part_number, (vol_index, part_offset, part_len) in enumerate(pieces, 1):
+            part_name = "%s.%0*d" % (arcname, digits, part_number)
+            append_piece({"kind": "chunk", "path": path, "arcname": part_name,
+                          "offset": part_offset, "length": part_len},
+                         vol_index, part_len + entry_overhead(part_name))
+            part_names.append(part_name)
+        chunked[arcname] = part_names
+
+    return {"volumes": volumes, "chunked": chunked}
+
+
 def build_temp_archive_path(input_file_path, processed_files=0):
     """隐写过程中临时 zip 的绝对路径。
 

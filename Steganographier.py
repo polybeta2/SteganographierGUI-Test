@@ -23,6 +23,7 @@ import io
 import sys
 import json
 import random
+import re
 import datetime
 import pyzipper
 import zipfile
@@ -666,6 +667,21 @@ def format_size(size):
         if size < 1024:
             return f"{size:.2f} {unit}"
         size /= 1024            
+
+def parse_size_to_bytes(value):
+    """把 '4G' / '4096M' / '512'（纯数字按 MB）解析为字节数；非法值抛 ValueError。"""
+    text = str(value).strip()
+    match = re.match(r"^(\d+)\s*([GgMm]?)$", text)
+    if not match:
+        raise ValueError("无法解析大小: %r（示例: 4G / 4096M / 512）" % value)
+    number = int(match.group(1))
+    if number <= 0:
+        raise ValueError("大小必须大于 0: %r" % value)
+    unit = match.group(2).lower()
+    if unit == "g":
+        return number * 1024 ** 3
+    return number * 1024 ** 2
+
 
 def check_size_and_duration(size, duration_seconds):
     duration_minutes = duration_seconds / 60

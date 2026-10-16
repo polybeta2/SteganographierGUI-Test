@@ -2270,13 +2270,42 @@ class Steganographier:
         self.compress_files(zip_file_path, input_file_path, processed_size=processed_size, password=password)    # 创建隐写的临时zip文件
 
         try: 
+            # 4. 计算输出路径并写入隐写文件（嵌入三分支见 _embed_zip_into_video）
+            output_file = self.get_output_file_path(
+                input_file_path, output_file_path, processed_files, 
+                self.output_option, self.output_cover_video_name_mode, cover_video_path
+            )
+            self._embed_zip_into_video(cover_video_path, zip_file_path, output_file, input_file_path)
+        except Exception as e:
+            self.log(f"隐写时发生未预料的错误: {str(e)}")
+            raise
+        finally:
+            # 5. 删除临时zip文件（容错：清理失败不应掩盖真正的错误）
+            try:
+                os.remove(zip_file_path)
+            except OSError as remove_error:
+                self.log(f"删除临时zip文件失败: {remove_error}")
+
+        self.log(f"Output file created: {os.path.exists(output_file)}\n")
+
+    def _report_progress(self, progress_callback, processed, total):
+        """统一的进度回调转发：分卷编排器传 fraction 回调；否则沿用旧的双参数回调。"""
+        if progress_callback is not None:
+            progress_callback(processed / total if total else 1.0)
+        elif self.progress_callback:
+            self.progress_callback(processed, total)
+
+    def _embed_zip_into_video(self, cover_video_path, zip_file_path, output_file,
+                              input_file_path=None, progress_callback=None):
+        """把 cover + free 原子 + zip 写为输出视频（mp4/mkv/zarchiver 三分支）。
+
+        与 hide_file() 的历史实现逐行等价：分支代码原样搬移（保留外层 try 以维持
+        缩进与异常语义），仅进度回调改经 _report_progress 转发，便于分卷编排器
+        按卷缩放进度。调用前置条件：self.type_option_var 已设置。
+        """
+        try:
             # 4.1. MP4文件隐写逻辑 - WinRAR版本
             if self.type_option_var == 'mp4':
-                output_file = self.get_output_file_path(
-                    input_file_path, output_file_path, processed_files, 
-                    self.output_option, self.output_cover_video_name_mode, cover_video_path
-                )
-                
                 self.log(f"输出文件: {output_file}")
                 
                 # 计算总大小用于进度显示。mp4 模式额外写入的只有 free 原子头（8 字节）
@@ -2297,8 +2326,7 @@ class Steganographier:
                             for chunk in self.read_in_chunks(cover_file):
                                 output.write(chunk)
                                 processed_size += len(chunk)
-                                if self.progress_callback:
-                                    self.progress_callback(processed_size, total_size_hidden)
+                                self._report_progress(progress_callback, processed_size, total_size_hidden)
                             
                             mp4_end_pos = output.tell()
                             self.log(f"MP4数据结束位置: {mp4_end_pos}")
@@ -2325,8 +2353,7 @@ class Steganographier:
                             for chunk in self.read_in_chunks(zip_file):
                                 output.write(chunk)
                                 processed_size += len(chunk)
-                                if self.progress_callback:
-                                    self.progress_callback(processed_size, total_size_hidden)
+                                self._report_progress(progress_callback, processed_size, total_size_hidden)
 
                             zip_end_pos = output.tell()
                             self.log(f"ZIP 已封装进 free 原子: {mp4_end_pos} - {zip_end_pos}")
@@ -2337,14 +2364,6 @@ class Steganographier:
 
             # 4.2. 隐写mkv文件的逻辑
             elif self.type_option_var == 'mkv':
-                # 指定输出文件名
-                output_file = self.get_output_file_path(input_file_path, 
-                                                        output_file_path, 
-                                                        processed_files, 
-                                                        self.output_option, 
-                                                        self.output_cover_video_name_mode,
-                                                        cover_video_path)
-                
                 # 生成末尾随机字节
                 random_data_path = f"temp_{generate_random_filename(length=16)}"
                 try:
@@ -2380,14 +2399,6 @@ class Steganographier:
 
             # 4.3. 适用于 zarchiver 的 MP4文件隐写逻辑
             elif self.type_option_var == 'mp4(zarchiver)':
-                # 指定输出文件名
-                output_file = self.get_output_file_path(input_file_path, 
-                                                        output_file_path, 
-                                                        processed_files, 
-                                                        self.output_option, 
-                                                        self.output_cover_video_name_mode,
-                                                        cover_video_path)
-
                 self.log(f"Output file: {output_file}")
             
                 try:
@@ -2427,14 +2438,12 @@ class Steganographier:
                             ftyp_data = cover_file.read(ftyp_atom['size'])
                             output.write(ftyp_data)
                             processed_size += len(ftyp_data)
-                            if self.progress_callback:
-                                self.progress_callback(processed_size, total_size_hidden)
+                            self._report_progress(progress_callback, processed_size, total_size_hidden)
                             
                             # 2. 写入包含隐藏数据的free原子
                             output.write(free_atom_with_data)
                             processed_size += len(free_atom_with_data)
-                            if self.progress_callback:
-                                self.progress_callback(processed_size, total_size_hidden)
+                            self._report_progress(progress_callback, processed_size, total_size_hidden)
                             
                             # 3. 写入剩余的原子数据，并更新偏移量引用
                             cover_file.seek(ftyp_atom['offset'] + ftyp_atom['size'])
@@ -2474,8 +2483,7 @@ class Steganographier:
                                 # 写入更新后的原子数据
                                 output.write(updated_atom_data)
                                 processed_size += len(updated_atom_data)
-                                if self.progress_callback:
-                                    self.progress_callback(processed_size, total_size_hidden)
+                                self._report_progress(progress_callback, processed_size, total_size_hidden)
                                 
                                 pos += size
                             
@@ -2510,14 +2518,6 @@ class Steganographier:
         except Exception as e:
             self.log(f"隐写时发生未预料的错误: {str(e)}")
             raise
-        finally:
-            # 5. 删除临时zip文件（容错：清理失败不应掩盖真正的错误）
-            try:
-                os.remove(zip_file_path)
-            except OSError as remove_error:
-                self.log(f"删除临时zip文件失败: {remove_error}")
-
-        self.log(f"Output file created: {os.path.exists(output_file)}\n")
 
     # 隐写时指定输出文件名+路径的方法
     def get_output_file_path(self, input_file_path=None, 

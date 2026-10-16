@@ -32,6 +32,7 @@ import threading
 import subprocess
 import string
 import shutil
+import getpass
 from hachoir.parser import createParser
 from hachoir.metadata import extractMetadata
 from natsort import ns, natsorted # windows风格的按名称排序专用包
@@ -827,6 +828,18 @@ def parse_size_to_bytes(value):
     return number * 1024 ** 2
 
 
+def prompt_password_interactive():
+    """隐藏回显地交互输入密码（两次确认）；直接回车 = 不设密码。"""
+    while True:
+        first = getpass.getpass("请输入密码（直接回车=不设密码）: ")
+        if not first:
+            return ""
+        second = getpass.getpass("请再次输入密码: ")
+        if first == second:
+            return first
+        print("两次输入不一致，请重新输入。")
+
+
 class CliProgressReporter:
     """CLI 进度渲染器：TTY 下单行原地刷新；非 TTY（重定向/管道/CI）每 10% 打一行。"""
 
@@ -1041,8 +1054,7 @@ class SteganographierGUI:
         self.captcha_generator_exe  = os.path.join(application_path,'tools','captcha_generator.exe')
         self.title = f"隐写者 Ver.{self.version} GUI 作者: 层林尽染"
         self.total_file_size = None
-        self.password = None
-        self.password_modified = False
+        self.password = ""  # 由「设置密码」对话框设置（v1.3.14 起不再有常驻输入框/不再持久化）
         self.check_file_size_and_duration_warned = False
         self.auto_clear_after_complete = False  # 执行完成后自动清空窗口的选项
         self.delete_original_after_reveal = True  # 解除隐写后默认删除原始文件
@@ -1116,35 +1128,13 @@ class SteganographierGUI:
         except tk.TclError:
             print("无法找到图标文件, 继续运行程序...")
 
-        # 密码输入框
+        # 密码设置（v1.3.14：对话框式；界面不展示明文，也不写入 config.json）
         self.password_label = tk.Label(params_frame, text="密码:")
         self.password_label.pack(side=tk.LEFT, padx=5)
-        self.password_entry = tk.Entry(params_frame, width=13, fg="grey")
-        
-        def clear_default_password(event):
-            if self.password_entry.get() == "留空则无密码":
-                self.password_entry.delete(0, tk.END)
-            self.password_entry.configure(fg="black") #, show="*"
-            self.password_modified = True
-
-        def restore_default_password(event):
-            if not self.password_entry.get():
-                self.password_entry.insert(0, "留空则无密码")
-                self.password_entry.configure(fg="grey", show="")
-                self.password_modified = False
-            else:
-                self.password_modified = True
-
-        if self.password:
-            self.password_entry.insert(0, self.password)
-            self.password_entry.configure(fg="black") # , show="*"
-            self.password_modified = True
-        else:
-            self.password_entry.insert(0, "留空则无密码")
-        
-        self.password_entry.pack(side=tk.LEFT, padx=10)
-        self.password_entry.bind("<FocusIn>", clear_default_password)
-        self.password_entry.bind("<FocusOut>", restore_default_password)
+        self.password_status_label = tk.Label(params_frame, fg="grey", text=self._password_status_text())
+        self.password_status_label.pack(side=tk.LEFT)
+        self.password_button = tk.Button(params_frame, text="设置密码", command=self.open_password_dialog, width=8)
+        self.password_button.pack(side=tk.LEFT, padx=6)
 
         # 工作模式选择
         self.type_option_label = tk.Label(params_frame, text="工作模式:")
@@ -1380,6 +1370,79 @@ class SteganographierGUI:
         """打开指定的URL链接"""
         webbrowser.open_new(url)
 
+    def _password_status_text(self):
+        return "已设置" if self.password else "未设置"
+
+    def _update_password_status(self):
+        label = getattr(self, "password_status_label", None)
+        if label is not None:
+            label.configure(text=self._password_status_text(), fg="black" if self.password else "grey")
+
+    def open_password_dialog(self):
+        """密码设置对话框（v1.3.14）：输入+确认、可切换显示、可清除；不持久化到配置。"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("设置密码")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.grab_set()
+        try:
+            dialog.iconbitmap(os.path.join(application_path, 'modules', 'favicon.ico'))
+        except tk.TclError:
+            pass
+
+        tk.Label(dialog, text="密码（留空表示不设密码）:").grid(row=0, column=0, sticky="w", padx=12, pady=(12, 2))
+        first_var = tk.StringVar(value=self.password or "")
+        first_entry = tk.Entry(dialog, textvariable=first_var, width=30, show="*")
+        first_entry.grid(row=1, column=0, padx=12, sticky="we")
+
+        tk.Label(dialog, text="再次输入:").grid(row=2, column=0, sticky="w", padx=12, pady=(8, 2))
+        second_var = tk.StringVar(value=self.password or "")
+        second_entry = tk.Entry(dialog, textvariable=second_var, width=30, show="*")
+        second_entry.grid(row=3, column=0, padx=12, sticky="we")
+
+        def apply_password(new_value):
+            self.password = new_value
+            self._update_password_status()
+
+        show_var = tk.BooleanVar(value=False)
+
+        def toggle_show():
+            mask = "" if show_var.get() else "*"
+            first_entry.configure(show=mask)
+            second_entry.configure(show=mask)
+
+        tk.Checkbutton(dialog, text="显示密码", variable=show_var, command=toggle_show).grid(
+            row=4, column=0, sticky="w", padx=10, pady=(6, 0))
+
+        def on_ok():
+            first = first_var.get()
+            if first != second_var.get():
+                messagebox.showerror("密码", "两次输入的密码不一致，请重新输入。", parent=dialog)
+                return
+            apply_password(first)
+            dialog.destroy()
+
+        def on_clear():
+            apply_password("")
+            dialog.destroy()
+
+        button_row = tk.Frame(dialog)
+        button_row.grid(row=5, column=0, pady=12)
+        tk.Button(button_row, text="确定", width=8, command=on_ok).pack(side=tk.LEFT, padx=4)
+        tk.Button(button_row, text="清除", width=8, command=on_clear).pack(side=tk.LEFT, padx=4)
+        tk.Button(button_row, text="取消", width=8, command=dialog.destroy).pack(side=tk.LEFT, padx=4)
+
+        dialog.bind("<Return>", lambda event: on_ok())
+        dialog.bind("<Escape>", lambda event: dialog.destroy())
+
+        dialog.update_idletasks()
+        x = self.root.winfo_rootx() + max(0, (self.root.winfo_width() - dialog.winfo_width()) // 2)
+        y = self.root.winfo_rooty() + max(0, (self.root.winfo_height() - dialog.winfo_height()) // 3)
+        dialog.geometry("+%d+%d" % (x, y))
+
+        first_entry.focus_set()
+        self.root.wait_window(dialog)
+
     ## 更新视频选项列表
     def update_video_options(self):
         """更新视频选择下拉框的选项（在 select_video_folder 方法中调用）"""
@@ -1594,12 +1657,7 @@ class SteganographierGUI:
         
         self.progress['value'] = 0 # 初始化进度条
         
-        # 2. 获取密码的逻辑
-        def get_password():
-            if not self.password_modified:
-                return ""  # 如果密码未修改过, 返回空字符串
-            return self.password_entry.get()
-        self.password = get_password()
+        # 2. 密码来自「设置密码」对话框（v1.3.14 起不再有常驻输入框）
         delete_after_reveal = self.delete_after_reveal_var.get()
         
         if self.type_option_var.get() == 'mkv': # MKV模式检查工具是否存在
@@ -1791,7 +1849,8 @@ class SteganographierGUI:
                     # 在这里设置默认的路径
                     self.video_folder_path = os.path.join(application_path, "cover_video")
                     
-                self.password = config.get('password', '')
+                # v1.3.14：密码不再从 config 读取（避免明文落盘），会话内通过「设置密码」对话框设置
+                self.password = ""
                 self.output_option = config.get('output_option', self.output_option)
                 self.type_option_var = tk.StringVar(value=config.get('type_option', 'mp4'))
                 self.output_cover_video_name_mode_var = tk.StringVar(value=config.get('output_cover_video_name_mode', ''))
@@ -1808,7 +1867,6 @@ class SteganographierGUI:
         volume_cap_mb = int(cap_text) * 1024 if cap_text.isdigit() and int(cap_text) > 0 else 4096
         config = {
             'video_folder_path': self.video_folder_path,
-            'password': self.password_entry.get() if self.password_modified else '',
             'output_option': self.output_option_var.get(),
             'type_option': self.type_option_var.get(),
             'output_cover_video_name_mode': self.output_cover_video_name_mode_var.get(),
@@ -3263,7 +3321,7 @@ class Steganographier:
                 # 转换密码为bytes（如果有密码）
                 password_bytes = test_password.encode('utf-8') if test_password else None
                 
-                self.log(f"尝试密码: '{test_password}' (len: {len(test_password)})")
+                self.log(f"尝试一个候选密码 (len: {len(test_password)})")
                 
                 # 尝试1: 使用标准zipfile（更快，支持标准ZIP加密）
                 try:
@@ -3273,7 +3331,7 @@ class Steganographier:
                         total_size_hidden
                     )
                     if success:
-                        self.log(f"使用zipfile解压成功，密码: {test_password}")
+                        self.log("使用zipfile解压成功（密码正确）")
                         return True
                 except (zipfile.BadZipFile, RuntimeError, ValueError) as e:
                     self.log(f"zipfile解压失败 (可能是AES加密): {str(e)[:100]}")
@@ -3286,7 +3344,7 @@ class Steganographier:
                         total_size_hidden
                     )
                     if success:
-                        self.log(f"使用pyzipper解压成功，密码: {test_password}")
+                        self.log("使用pyzipper解压成功（密码正确）")
                         return True
                 except (pyzipper.BadZipFile, RuntimeError, ValueError) as e:
                     self.log(f"pyzipper解压失败: {str(e)[:100]}")
@@ -3676,7 +3734,7 @@ class Steganographier:
                                     success = False
                                     for password in password_list:
                                         try:
-                                            log_func(f"尝试密码: {'(空密码)' if not password else password}")
+                                            log_func(f"尝试{'空密码' if not password else '候选密码'}")
                                             
                                             # 使用BytesIO创建内存中的ZIP文件对象
                                             zip_buffer = io.BytesIO(free_data)
@@ -3692,11 +3750,11 @@ class Steganographier:
                                                 # 解压所有文件到输出目录（支持自动重命名）
                                                 self._extract_zip_members(zip_file, output_dir)
                                                 success = True
-                                                log_func(f"成功解压，使用密码: {'(空密码)' if not password else password}")
+                                                log_func(f"成功解压（使用{'空密码' if not password else '密码'}）")
                                                 break
                                                 
                                         except Exception as e:
-                                            log_func(f"密码 {'(空密码)' if not password else password} 解压失败: {e}")
+                                            log_func(f"密码尝试失败（{'空密码' if not password else '非空密码'}）: {e}")
                                             continue
                                     
                                     if success:
@@ -4043,11 +4101,11 @@ class Steganographier:
                             self._extract_zip_members(zip_file, os.path.dirname(input_file_path))
 
                         os.remove(zip_path)
-                        self.log(f"ZIP解压成功，使用密码: {test_password}")
+                        self.log("ZIP解压成功（密码正确）")
                         return True
 
                     except RuntimeError as e:
-                        self.log(f"使用密码 {test_password} 解压失败: {e}")
+                        self.log(f"密码尝试解压失败: {e}")
                         continue
 
                 self.log("所有密码尝试失败，无法解压ZIP文件")
@@ -4073,7 +4131,7 @@ class Steganographier:
         """
         self.log(f"输入文件/文件夹路径: {args.input}")
         self.log(f"输出文件/文件夹路径: {args.output}")
-        self.log(f"密码: {args.password}")
+        self.log("密码: %s" % ("已设置" if args.password else "未设置"))
         self.log(f"输出文件类型: {args.type}")
         self.log(f"设定外壳MP4视频路径: {args.cover}")
         self.log(f"执行解除隐写: {args.reveal}")
@@ -4372,7 +4430,7 @@ if __name__ == "__main__":
     parser.add_argument('-h', '--help', action='store_true', help='显示此帮助并退出')
     parser.add_argument('-i', '--input', default=None, help='指定输入文件或文件夹的路径')
     parser.add_argument('-o', '--output', default=None, help='1.指定输出文件名(包含后缀名) [或] 2.输出文件夹路径(默认为原文件名+"hidden")')
-    parser.add_argument('-p', '--password', default='', help='设置密码 (默认无密码)')
+    parser.add_argument('-p', '--password', nargs='?', default='', const=None, help='设置密码（不带值时交互输入，隐藏回显；默认无密码）')
     parser.add_argument('-t', '--type', default='mp4', choices=['mp4', 'mkv'], help='设置输出文件类型 (默认为mp4)')
     parser.add_argument('-c', '--cover', default=None, help='指定外壳MP4视频（默认在程序同路径下搜索）')
     parser.add_argument('-r', '--reveal', action='store_true', help='执行解除隐写')
@@ -4396,6 +4454,10 @@ if __name__ == "__main__":
         parser.error("--volume-size 仅用于隐写，不能与解除隐写相关参数同时使用")
     if args.volume_mode != 'zip' and args.volume_size is None:
         parser.error("--volume-mode 需与 --volume-size 一起使用")
+
+    # -p 不带值时交互输入密码（隐藏回显，不进 shell 历史/进程列表）
+    if args.password is None:
+        args.password = prompt_password_interactive()
 
     # 如果请求帮助，直接打印并退出（避免继续进入 GUI）
     if getattr(args, 'help', False):
@@ -4488,7 +4550,10 @@ if __name__ == "__main__":
 
         steganographier.cli_reporter = CliProgressReporter()
         steganographier.progress_callback = steganographier.cli_reporter.update
-        print(args)
+        printable_args = dict(vars(args))
+        if printable_args.get('password'):
+            printable_args['password'] = '<已设置>'
+        print(printable_args)
         try:
             steganographier.run_cli(args) # 调用run_cli方法
         finally:

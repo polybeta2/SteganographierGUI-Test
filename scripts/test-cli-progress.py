@@ -16,6 +16,7 @@ import tempfile
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODULE_PATH = os.path.join(REPO_ROOT, "Steganographier.py")
+SEVEN_ZIP = os.path.join(REPO_ROOT, "tools", "7z.exe")
 
 
 def load_module():
@@ -102,6 +103,45 @@ def test_cli_echo_and_progress_via_subprocess(module, work_root):
     print("  ok   cli echo + progress via subprocess")
 
 
+def test_cli_password_not_leaked(module, work_root):
+    case = os.path.join(work_root, "masked")
+    payload, cover = make_fixture(case)
+    result = subprocess.run([sys.executable, MODULE_PATH, "-i", payload, "--no-log", "-c", cover,
+                             "-p", "Sup3rSecret!x"],
+                            capture_output=True, text=True, encoding="utf-8",
+                            errors="replace", cwd=work_root)
+    if result.returncode != 0:
+        raise AssertionError("CLI failed:\n%s" % (result.stdout + result.stderr))
+    if "Sup3rSecret!x" in result.stdout or "Sup3rSecret!x" in result.stderr:
+        raise AssertionError("密码明文出现在输出中")
+    if "密码: 已设置" not in result.stdout:
+        raise AssertionError("缺少脱敏后的密码状态行: %r" % result.stdout)
+    print("  ok   cli password masked")
+
+
+def test_password_prompt_logic(module):
+    """交互输入逻辑单测（Windows 下 getpass 直读控制台，无法用管道做 e2e，改注入假 getpass）。"""
+    original = module.getpass.getpass
+    try:
+        # 两次一致：返回该密码
+        sequence = ["secret1", "secret1"]
+        module.getpass.getpass = lambda prompt="": sequence.pop(0)
+        if module.prompt_password_interactive() != "secret1":
+            raise AssertionError("两次一致的输入应返回该密码")
+        # 先不一致后一致：重试后返回第二次输入的值
+        sequence = ["aaa", "bbb", "ccc", "ccc"]
+        module.getpass.getpass = lambda prompt="": sequence.pop(0)
+        if module.prompt_password_interactive() != "ccc":
+            raise AssertionError("不一致后重试逻辑错误")
+        # 直接回车：不设密码
+        module.getpass.getpass = lambda prompt="": ""
+        if module.prompt_password_interactive() != "":
+            raise AssertionError("空输入应返回空密码")
+    finally:
+        module.getpass.getpass = original
+    print("  ok   password prompt logic")
+
+
 def main():
     module = load_module()
     work_root = tempfile.mkdtemp(prefix="steg-cli-progress-test-")
@@ -109,6 +149,8 @@ def main():
         test_tty_single_line_rendering(module)
         test_non_tty_percent_lines(module)
         test_cli_echo_and_progress_via_subprocess(module, work_root)
+        test_cli_password_not_leaked(module, work_root)
+        test_password_prompt_logic(module)
     finally:
         shutil.rmtree(work_root, ignore_errors=True)
     print("CLI-progress tests passed.")

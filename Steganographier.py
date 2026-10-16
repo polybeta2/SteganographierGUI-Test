@@ -6,7 +6,7 @@ Created on Mon Apr 22 14:56:41 2024
 
 # 创建并激活虚拟环境（如果尚未创建）
 python -m venv hide
-.\Scripts\activate
+.\\Scripts\\activate
 python -m pip install -U pip setuptools wheel
 
 pip install tkinterdnd2 -i http://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com

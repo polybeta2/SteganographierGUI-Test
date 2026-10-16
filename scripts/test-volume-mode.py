@@ -172,6 +172,40 @@ def test_without_volume_flags_unchanged(module, work_root):
     print("  ok   regression: single-volume path unchanged")
 
 
+def test_mode_split_via_cli(module, work_root):
+    payload, covers = make_fixture(work_root, "t4")
+    run_cli(["-i", payload, "--volume-size", "32M", "--volume-mode", "split",
+             "-p", "pw123", "--no-log", "-c", os.path.join(covers, "c1.mp4")], cwd=work_root)
+    base = os.path.dirname(payload)   # 输出落在输入的同级目录
+    outputs = sorted(name for name in os.listdir(base) if re.search(r"_\d+of\d+\.mp4$", name))
+    if len(outputs) < 2:
+        raise AssertionError("split mode produced %r" % outputs)
+    collect = os.path.join(work_root, "split_parts")
+    os.makedirs(collect, exist_ok=True)
+    for index, name in enumerate(outputs, 1):
+        dest = os.path.join(work_root, "split_extract_%d" % index)
+        extract_video(os.path.join(base, name), dest)
+        for dirpath, _dirs, files in os.walk(dest):
+            for item in files:
+                shutil.move(os.path.join(dirpath, item), os.path.join(collect, item))
+    part_001 = sorted(n for n in os.listdir(collect) if ".zip." in n and n.endswith(".001"))
+    if len(part_001) != 1:
+        raise AssertionError("split parts missing: %r" % os.listdir(collect))
+    if not any(n == "解压说明.txt" for n in os.listdir(collect)):
+        raise AssertionError("解压说明.txt missing: %r" % os.listdir(collect))
+    out_dir = os.path.join(work_root, "split_out")
+    result = subprocess.run([SEVEN_ZIP, "x", "-y", "-o" + out_dir, "-ppw123",
+                             os.path.join(collect, part_001[0])],
+                            capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if result.returncode != 0:
+        raise AssertionError("7z join/extract failed:\n" + result.stdout + result.stderr)
+    for name in ("a.bin", "big.bin"):
+        extracted = os.path.join(out_dir, "payload", name)
+        if sha256_of(extracted) != sha256_of(os.path.join(payload, name)):
+            raise AssertionError("split content mismatch: %s" % name)
+    print("  ok   mode split: %d parts, joined extraction verified" % len(outputs))
+
+
 def main():
     module = load_module()
     work_root = tempfile.mkdtemp(prefix="steg-volume-test-")
@@ -179,6 +213,7 @@ def main():
         test_mode_zip_chunks_big_file(module, work_root)
         test_mode_zip_via_cli_and_reveal(module, work_root)
         test_without_volume_flags_unchanged(module, work_root)
+        test_mode_split_via_cli(module, work_root)
     finally:
         shutil.rmtree(work_root, ignore_errors=True)
     print("Volume-mode tests passed.")

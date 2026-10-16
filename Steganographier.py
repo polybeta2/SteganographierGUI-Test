@@ -31,6 +31,7 @@ import tempfile
 import threading
 import subprocess
 import string
+import shutil
 from hachoir.parser import createParser
 from hachoir.metadata import extractMetadata
 from natsort import ns, natsorted # windows风格的按名称排序专用包
@@ -608,6 +609,21 @@ def build_merge_note(chunked):
         lines.append('copy /b %s "%s"' % (commands, original))
     lines += ["", "也可以用 7-Zip：选中第一个 .00N 片段 → 菜单「文件」→「合并文件」。"]
     return "\n".join(lines) + "\n"
+
+
+def build_split_readme(part_index, part_total, archive_name):
+    """真分卷模式的《解压说明.txt》（接收端操作指引，逐卷各放一份）。"""
+    return (
+        "【分卷解压说明】\n"
+        "本视频内藏有分卷压缩包「%s」的第 %d 个分卷（共 %d 个），全部内容分散在 %d 个视频里。\n"
+        "1. 把每个视频文件的后缀名改为 .zip，用任意解压软件解压，得到 %s.001 ~ %s.%03d。\n"
+        "2. 把全部分卷放在同一个文件夹里（解压到同一目录即可）。\n"
+        "3. 用 7-Zip、Bandizip 或新版 WinRAR 打开 %s.001，直接解压全部内容。\n"
+        "   如果设置了密码，此时输入。\n"
+        "注意：分卷必须全部齐全才能解压；旧版 WinRAR 打不开 .001 分卷时，请改用 7-Zip 或 Bandizip。\n"
+        % (archive_name, part_index, part_total, part_total,
+           archive_name, archive_name, part_total, archive_name)
+    )
 
 
 def collect_input_entries(input_file_path, exclude_path, log=None):
@@ -2544,11 +2560,94 @@ class Steganographier:
             raise ValueError("%s 文件夹下没有可用的 MP4 外壳" % video_folder_path)
         return candidates
 
+    def _create_split_archive_with_7z(self, input_file_path, part_size_bytes, password=None):
+        """用捆绑 7z.exe 生成真分卷 zip；返回 (分卷路径列表, 临时目录)。
+
+        参数组合经 2026-10-16 实测：-tzip -v{N}b 命名 .zip.001…；有密码时
+        -mx=0 -p -mem=AES256，否则 -mx=5。进度经 -bsp1 的百分比行按 10% 步进记日志。
+        """
+        base = os.path.basename(os.path.normpath(input_file_path))
+        parent = os.path.dirname(os.path.abspath(os.path.normpath(input_file_path)))
+        temp_dir = os.path.join(parent, "%s_hidden_split_%s" % (base, generate_random_filename(8)))
+        os.makedirs(temp_dir)
+        archive_path = os.path.join(temp_dir, "%s_hidden.zip" % base)
+        cmd = [self._7z_exe, "a", "-tzip", "-v%db" % part_size_bytes, "-bsp1"]
+        if password:
+            cmd += ["-mx=0", "-mem=AES256", "-p%s" % password]
+        else:
+            cmd += ["-mx=5"]
+        cmd += [archive_path, input_file_path]
+        self.log("正在生成真分卷: %s" % os.path.basename(archive_path))
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   text=True, encoding="utf-8", errors="replace")
+        last_reported = -10
+        for line in process.stdout:
+            match = re.search(r"(\d+)%", line)
+            if match:
+                percent = int(match.group(1))
+                if percent >= last_reported + 10:
+                    last_reported = percent
+                    self.log("分卷打包中… %d%%" % percent)
+        returncode = process.wait()
+        if returncode != 0:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            raise RuntimeError("7z 生成分卷失败，退出码 %d" % returncode)
+        prefix = os.path.basename(archive_path) + "."
+        parts = [os.path.join(temp_dir, name) for name in sorted(os.listdir(temp_dir))
+                 if name.startswith(prefix)]
+        if not parts:
+            raise RuntimeError("7z 未产出任何分卷: %s" % archive_path)
+        return parts, temp_dir
+
     def _hide_volumized_split(self, input_file_path, volume_cap_bytes, cover_candidates,
                               budgets, processed_files, output_option,
                               output_cover_video_name_mode, output_dir, password):
-        """真分卷模式的占位实现；方法体在后续任务替换为真实现在。"""
-        raise NotImplementedError("真分卷模式将在下一个任务实现")
+        """真分卷模式：7z 生成 .zip.001…，逐卷装入不加密载具 zip 后隐写。"""
+        part_size = volume_cap_bytes - max(os.path.getsize(c) for c in cover_candidates) \
+            - VOLUME_SIZE_MARGIN_BYTES
+        if part_size < MIN_VOLUME_CAP_BYTES:
+            raise ValueError("上限太小：扣除最大的外壳与 1MB 余量后仅剩 %s，请调大上限"
+                             % format_size(max(part_size, 0)))
+        parts, temp_dir = self._create_split_archive_with_7z(input_file_path, part_size, password)
+        total = len(parts)
+        archive_name = os.path.basename(parts[0])[: -len(".001")]
+        if total > 1 and len(cover_candidates) == 1:
+            self.log("提示：候选外壳只有 1 个，%d 个卷将重复使用同一外壳" % total)
+        outputs = []
+        try:
+            for index, part in enumerate(parts):
+                k = index + 1
+                cover = cover_candidates[(processed_files + index) % len(cover_candidates)]
+                output_file = self.get_output_file_path(
+                    input_file_path, None, processed_files, output_option,
+                    output_cover_video_name_mode, cover,
+                    volume_index=k, volume_total=total, output_directory=output_dir)
+                container = build_temp_archive_path(input_file_path, processed_files + index)
+                piece = {"kind": "whole", "path": part,
+                         "arcname": os.path.basename(part), "size": os.path.getsize(part)}
+                extra = [("解压说明.txt",
+                          build_split_readme(k, total, archive_name).encode("utf-8-sig"))]
+                self.log("第 %d/%d 卷：打包载具…" % (k, total))
+                try:
+                    self.compress_entry_list(container, [piece], password=None, extra_entries=extra)
+                    self.log("第 %d/%d 卷：隐写中…" % (k, total))
+                    embed_progress = None
+                    if self.progress_callback:
+                        embed_progress = lambda frac, k=k: self.progress_callback(
+                            k - 1 + frac, total)
+                    self._embed_zip_into_video(cover, container, output_file,
+                                               input_file_path=input_file_path,
+                                               progress_callback=embed_progress)
+                    outputs.append(output_file)
+                    self.log("第 %d/%d 卷：完成 -> %s" % (k, total, output_file))
+                finally:
+                    try:
+                        os.remove(container)
+                    except OSError as remove_error:
+                        self.log("删除临时载具失败: %s" % remove_error)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        return {"volumes": total, "outputs": outputs, "chunked": {}, "mode": "split"}
 
     def hide_volumized(self, input_file_path, volume_cap_bytes, password=None, processed_files=0,
                        output_option=None, output_cover_video_name_mode=None, type_option_var=None,
@@ -3866,6 +3965,9 @@ class Steganographier:
                             video_folder_path=cover_candidates_dir,
                             cover_video_CLI=args.cover, output_dir=output_dir, volume_mode=args.volume_mode)
                     except ValueError as error:
+                        print("错误: %s" % error)
+                        sys.exit(1)
+                    except RuntimeError as error:
                         print("错误: %s" % error)
                         sys.exit(1)
                     print("分卷隐写完成：共 %d 个视频" % summary["volumes"])

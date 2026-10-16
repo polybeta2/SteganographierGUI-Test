@@ -599,6 +599,43 @@ def plan_volumes(entries, volume_budgets, chunk_min_bytes=MIN_VOLUME_CAP_BYTES,
     return {"volumes": volumes, "chunked": chunked}
 
 
+def collect_input_entries(input_file_path, exclude_path, log=None):
+    """收集 (full_path, arcname, size) 列表；exclude_path（正在写入的临时包）必须被排除。
+
+    排除自身是 v1.3.10 事故的教训：临时包若落在输入目录内部，os.walk 会把它列出，
+    随后一边读一边追加导致无限膨胀（见 compress_files 顶部注释）。
+    """
+    input_file_path = os.path.normpath(input_file_path)
+    archive_path = os.path.normcase(os.path.abspath(exclude_path)) if exclude_path else None
+    entries = []
+    if os.path.isdir(input_file_path):
+        root_folder = os.path.basename(input_file_path)
+        for root, dirs, files in os.walk(input_file_path):
+            for file in files:
+                full_path = os.path.join(root, file)
+                if archive_path and os.path.normcase(os.path.abspath(full_path)) == archive_path:
+                    if log:
+                        log("跳过临时压缩包自身: %s" % full_path)
+                    continue
+                arcname = os.path.join(root_folder, os.path.relpath(full_path, start=input_file_path))
+                entries.append((full_path, arcname, os.path.getsize(full_path)))
+    else:
+        entries.append((input_file_path, os.path.basename(input_file_path), os.path.getsize(input_file_path)))
+    return entries
+
+
+def _random_zip_date_time():
+    """生成随机且合法的 zip 时间戳（沿用现有随机化习惯）。"""
+    while True:
+        try:
+            date_time = (random.randint(1980, 2099), random.randint(1, 12), random.randint(1, 28),
+                         random.randint(0, 23), random.randint(0, 59), random.randint(0, 59))
+            datetime.datetime(*date_time)
+            return date_time
+        except ValueError:
+            continue
+
+
 def build_temp_archive_path(input_file_path, processed_files=0):
     """隐写过程中临时 zip 的绝对路径。
 
@@ -2036,24 +2073,9 @@ class Steganographier:
         # 收集要压缩的文件列表。必须排除目标压缩包自身：若压缩包位于输入目录内部，
         # os.walk 会把它一并列出，随后 zipfile.write() 会一边读、一边向同一个文件
         # 追加，压缩包因此无限膨胀并卡死（实测约 60 MB/s，1 MB 输入涨到 7.25 GB）。
-        def collect_zip_entries():
-            archive_path = os.path.normcase(os.path.abspath(zip_file_path))
-            entries = []
-
-            if os.path.isdir(input_file_path):
-                root_folder = os.path.basename(input_file_path)
-                for root, dirs, files in os.walk(input_file_path):
-                    for file in files:
-                        file_full_path = os.path.join(root, file)
-                        if os.path.normcase(os.path.abspath(file_full_path)) == archive_path:
-                            self.log(f"跳过临时压缩包自身: {file_full_path}")
-                            continue
-                        arcname = os.path.join(root_folder, os.path.relpath(file_full_path, start=input_file_path))
-                        entries.append((file_full_path, arcname))
-            else:
-                entries.append((input_file_path, os.path.basename(input_file_path)))
-
-            return entries
+        # 排除逻辑已抽到 collect_input_entries（分卷流程共用），此处拆回二元组保持后续写法不变。
+        entries = collect_input_entries(input_file_path, zip_file_path, log=self.log)
+        file_list = [(full_path, arcname) for full_path, arcname, _size in entries]
 
         if password:
             # 当设置了密码时，使用 pyzipper 进行 AES 加密
@@ -2066,9 +2088,6 @@ class Steganographier:
             with zip_file:
                 self.log(f"Compressing file with encryption: {input_file_path}")
                 self.log("较大的文件可能会花费较长时间...")
-
-                # 收集所有需要压缩的文件
-                file_list = collect_zip_entries()
 
                 # 随机化文件列表顺序
                 random.shuffle(file_list)
@@ -2095,9 +2114,6 @@ class Steganographier:
             with zip_file:
                 self.log(f"Compressing file without encryption: {input_file_path}")
                 self.log("较大的文件可能会花费较长时间...")
-
-                # 收集所有需要压缩的文件
-                file_list = collect_zip_entries()
 
                 # 随机化文件列表顺序
                 random.shuffle(file_list)
@@ -2150,6 +2166,75 @@ class Steganographier:
 
 
 
+
+    def compress_entry_list(self, zip_file_path, pieces, password=None, comment=None,
+                            extra_entries=None, progress_callback=None):
+        """把卷计划的 pieces 写入 zip（支持跨卷切块片段的流式写入）。
+
+        - whole 片段沿用现有随机化习惯（加密时仅存储；无密码时随机压缩等级）；
+        - chunk 片段一律 ZIP_STORED（大体积快速写入），保留随机时间戳；
+        - 写模式加密走归档级 setpassword（pyzipper 的 open(pwd=…) 参数在写模式不生效）；
+        - extra_entries: [(arcname, payload_bytes)]，如《合并说明.txt》。
+        """
+        total_size = sum(p["size"] if p["kind"] == "whole" else p["length"] for p in pieces)
+        if extra_entries:
+            total_size += sum(len(payload) for _arcname, payload in extra_entries)
+        processed_size = 0
+
+        def report():
+            if progress_callback:
+                progress_callback(processed_size, total_size)
+
+        if password:
+            zip_file = pyzipper.AESZipFile(zip_file_path, 'w',
+                                           compression=pyzipper.ZIP_DEFLATED,
+                                           encryption=pyzipper.WZ_AES)
+            zip_file.setpassword(password.encode('utf-8'))
+        else:
+            zip_file = zipfile.ZipFile(zip_file_path, 'w')
+
+        with zip_file:
+            for piece in pieces:
+                if piece["kind"] == "whole":
+                    if password:
+                        zip_file.write(piece["path"], arcname=piece["arcname"],
+                                       compress_type=pyzipper.ZIP_STORED)
+                    else:
+                        zip_file.write(piece["path"], arcname=piece["arcname"],
+                                       compress_type=zipfile.ZIP_DEFLATED,
+                                       compresslevel=random.randint(1, 9))
+                    processed_size += piece["size"]
+                    report()
+                else:
+                    zipinfo_cls = getattr(zip_file, "zipinfo_cls", zipfile.ZipInfo)
+                    zi = zipinfo_cls(piece["arcname"])
+                    zi.date_time = _random_zip_date_time()
+                    zi.compress_type = zipfile.ZIP_STORED
+                    zi.file_size = piece["length"]
+                    with zip_file.open(zi, "w") as writer:
+                        with open(piece["path"], "rb") as source:
+                            source.seek(piece["offset"])
+                            remaining = piece["length"]
+                            while remaining > 0:
+                                chunk = source.read(min(4 * 1024 * 1024, remaining))
+                                if not chunk:
+                                    break
+                                writer.write(chunk)
+                                remaining -= len(chunk)
+                                processed_size += len(chunk)
+                                report()
+            for arcname, payload in (extra_entries or []):
+                zipinfo_cls = getattr(zip_file, "zipinfo_cls", zipfile.ZipInfo)
+                zi = zipinfo_cls(arcname)
+                zi.date_time = _random_zip_date_time()
+                zi.compress_type = zipfile.ZIP_DEFLATED
+                zi.file_size = len(payload)
+                with zip_file.open(zi, "w") as writer:
+                    writer.write(payload)
+                processed_size += len(payload)
+                report()
+            if comment:
+                zip_file.comment = comment.encode("utf-8")
 
     def hide_file(self, input_file_path, 
                   cover_video_CLI=None, 

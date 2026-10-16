@@ -979,6 +979,9 @@ class SteganographierGUI:
         self.delete_original_after_reveal = True  # 解除隐写后默认删除原始文件
         self.auto_rename_on_conflict = False  # 解除隐写时遇到同名文件是否自动重命名
         self.auto_rename_hide_on_conflict = False  # 隐写时遇到同名输出文件是否自动重命名
+        self.volume_enabled = False        # 自动分卷勾选
+        self.volume_cap_gb = 4             # 每卷上限（GB，整数输入框）
+        self.volume_mode = "zip"           # zip=独立压缩包 / split=真分卷
         self.cover_video_options = []
         
         self.hash_modifier_process = None
@@ -1170,7 +1173,29 @@ class SteganographierGUI:
 
         self.video_option_combobox.bind("<<ComboboxSelected>>", on_video_selection_change)
 
-        
+        # 1.3.1 自动分卷（大文件夹按上限拆成多个隐写视频）
+        volume_frame = tk.Frame(self.root)
+        volume_frame.pack(pady=4)
+
+        self.volume_enabled_var = tk.BooleanVar(value=self.volume_enabled)
+        self.volume_enabled_checkbox = tk.Checkbutton(volume_frame, text="自动分卷",
+                                                      variable=self.volume_enabled_var)
+        self.volume_enabled_checkbox.pack(side=tk.LEFT, padx=8)
+
+        tk.Label(volume_frame, text="每卷上限").pack(side=tk.LEFT)
+        self.volume_cap_entry = tk.Entry(volume_frame, width=6)
+        self.volume_cap_entry.insert(0, str(self.volume_cap_gb))
+        self.volume_cap_entry.pack(side=tk.LEFT, padx=4)
+        tk.Label(volume_frame, text="GB").pack(side=tk.LEFT)
+
+        self.volume_mode_var = tk.StringVar(value="真分卷（需 .001 配套工具）"
+                                            if self.volume_mode == "split"
+                                            else "独立压缩包（推荐）")
+        self.volume_mode_menu = ttk.Combobox(volume_frame, textvariable=self.volume_mode_var,
+                                             state="readonly", width=24,
+                                             values=["独立压缩包（推荐）", "真分卷（需 .001 配套工具）"])
+        self.volume_mode_menu.pack(side=tk.LEFT, padx=8)
+
         # 1.4 log文本框和滚动条
         log_frame = tk.Frame(self.root)
         log_frame.pack(pady=5, padx=10, fill=tk.BOTH, expand=True)  # 调整布局管理器为 pack，支持扩展
@@ -1535,6 +1560,28 @@ class SteganographierGUI:
             self.clear_button.configure(state=tk.NORMAL)
             return        
         
+        # 4.1 自动分卷参数校验（勾选时生效）
+        volume_enabled = self.volume_enabled_var.get()
+        volume_cap_bytes = 0
+        if volume_enabled:
+            if self.type_option_var.get() == 'mp4(zarchiver)':
+                messagebox.showerror("参数错误", "mp4(zarchiver) 模式不支持自动分卷")
+                self.start_button.configure(state=tk.NORMAL)
+                self.clear_button.configure(state=tk.NORMAL)
+                return
+            try:
+                cap_gb = int(self.volume_cap_entry.get().strip())
+                if cap_gb <= 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("参数错误", "每卷上限需要是大于 0 的整数（GB）")
+                self.start_button.configure(state=tk.NORMAL)
+                self.clear_button.configure(state=tk.NORMAL)
+                return
+            volume_cap_bytes = cap_gb * 1024 ** 3
+            if self.type_option_var.get() == 'mkv' and volume_cap_bytes > 2 * 1024 ** 3:
+                self.log("提示：mkv 模式每卷上限将自动收敛到 2GB")
+
         total_files = len(hide_file_paths) + len(reveal_file_paths)
         
         # 5. 隐写流程
@@ -1543,17 +1590,36 @@ class SteganographierGUI:
         processed_files = 0
         for input_file_path in hide_file_paths:
             if input_file_path:
-                # 执行隐写
-                self.steganographier.hide_file(
-                    input_file_path=input_file_path, 
-                    password=self.password,
-                    processed_files=processed_files,
-                    output_option=self.output_option_var.get(),
-                    output_cover_video_name_mode=self.output_cover_video_name_mode_var.get(),
-                    type_option_var=self.type_option_var.get(),
-                    video_folder_path=self.video_folder_path
-                )
-                processed_files += 1
+                use_volume = volume_enabled and os.path.exists(input_file_path) and (
+                    os.path.isdir(input_file_path)
+                    or os.path.getsize(input_file_path) > volume_cap_bytes)
+                if use_volume:
+                    summary = self.steganographier.hide_volumized(
+                        input_file_path=input_file_path,
+                        volume_cap_bytes=volume_cap_bytes,
+                        password=self.password,
+                        processed_files=processed_files,
+                        output_option=self.output_option_var.get(),
+                        output_cover_video_name_mode=self.output_cover_video_name_mode_var.get(),
+                        type_option_var=self.type_option_var.get(),
+                        video_folder_path=self.video_folder_path,
+                        volume_mode="split" if "真分卷" in self.volume_mode_var.get() else "zip")
+                    processed_files += summary["volumes"]
+                    if summary["volumes"] > 1:
+                        self.log("已生成 %d 个分卷视频（上限 %dGB）"
+                                 % (summary["volumes"], volume_cap_bytes // (1024 ** 3)))
+                else:
+                    # 执行隐写
+                    self.steganographier.hide_file(
+                        input_file_path=input_file_path, 
+                        password=self.password,
+                        processed_files=processed_files,
+                        output_option=self.output_option_var.get(),
+                        output_cover_video_name_mode=self.output_cover_video_name_mode_var.get(),
+                        type_option_var=self.type_option_var.get(),
+                        video_folder_path=self.video_folder_path
+                    )
+                    processed_files += 1
                 self.update_progress(processed_files, total_files)
 
         # 6. 解除隐写流程
@@ -1664,8 +1730,13 @@ class SteganographierGUI:
                 self.delete_original_after_reveal = config.get('delete_original_after_reveal', True)
                 self.auto_rename_on_conflict = config.get('auto_rename_on_conflict', False)
                 self.auto_rename_hide_on_conflict = config.get('auto_rename_hide_on_conflict', False)
+                self.volume_enabled = config.get('volume_enabled', False)
+                self.volume_cap_gb = max(1, int(round(config.get('volume_cap_mb', 4096) / 1024)))
+                self.volume_mode = config.get('volume_mode', 'zip')
 
     def save_config(self):
+        cap_text = self.volume_cap_entry.get().strip()
+        volume_cap_mb = int(cap_text) * 1024 if cap_text.isdigit() and int(cap_text) > 0 else 4096
         config = {
             'video_folder_path': self.video_folder_path,
             'password': self.password_entry.get() if self.password_modified else '',
@@ -1675,7 +1746,10 @@ class SteganographierGUI:
             'auto_clear_after_complete': self.auto_clear_var.get(),
             'delete_original_after_reveal': self.delete_after_reveal_var.get(),
             'auto_rename_on_conflict': self.auto_rename_var.get(),
-            'auto_rename_hide_on_conflict': self.auto_rename_hide_var.get()
+            'auto_rename_hide_on_conflict': self.auto_rename_hide_var.get(),
+            'volume_enabled': self.volume_enabled_var.get(),
+            'volume_cap_mb': volume_cap_mb,
+            'volume_mode': "split" if "真分卷" in self.volume_mode_var.get() else "zip"
         }
         with open(self.config_file, 'w') as f:
             json.dump(config, f, indent=4)

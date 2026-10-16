@@ -43,3 +43,4 @@ jobs:
           python .\scripts\test-reveal-keeps-original.py
           python .\scripts\test-volume-plan.py
           python .\scripts\test-volume-mode.py
+          python .\scripts\test-cli-progress.py

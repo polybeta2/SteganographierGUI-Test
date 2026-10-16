@@ -827,6 +827,75 @@ def parse_size_to_bytes(value):
     return number * 1024 ** 2
 
 
+class CliProgressReporter:
+    """CLI 进度渲染器：TTY 下单行原地刷新；非 TTY（重定向/管道/CI）每 10% 打一行。"""
+
+    THROTTLE_SECONDS = 0.05
+
+    def __init__(self, stream=None):
+        self.stream = stream if stream is not None else sys.stdout
+        self.is_tty = bool(getattr(self.stream, "isatty", lambda: False)())
+        self.phase = ""
+        self.line_open = False
+        self.start_time = None
+        self.last_emit = 0.0
+        self.last_percent_bucket = -1
+        self.last_line_len = 0
+
+    def set_phase(self, label):
+        """阶段切换：先收束上一行，再记录新阶段（速度按阶段独立统计）。"""
+        self.close_line()
+        self.phase = label
+        self.start_time = None
+        self.last_emit = 0.0
+        self.last_percent_bucket = -1
+
+    def close_line(self):
+        """收束当前进度行（补一个换行），供阶段切换与日志回显调用。"""
+        if self.line_open:
+            self.stream.write("\n")
+            self.stream.flush()
+            self.line_open = False
+
+    def update(self, processed, total):
+        if not total:
+            return
+        now = time.time()
+        if self.start_time is None:
+            self.start_time = now
+        percent = int(processed * 100 / total)
+        if percent > 100:
+            percent = 100
+        if self.is_tty:
+            if percent < 100 and now - self.last_emit < self.THROTTLE_SECONDS:
+                return
+            self.last_emit = now
+            elapsed = max(now - self.start_time, 0.001)
+            speed = processed / elapsed
+            line = "%s %3d%% (%s/%s, %s/s" % (self.phase or "进度", percent,
+                                              format_size(processed), format_size(total),
+                                              format_size(speed))
+            if percent < 100 and speed > 0:
+                line += " 剩 %s" % format_duration(int((total - processed) / speed))
+            line += ")"
+            padding = " " * max(0, self.last_line_len - len(line))
+            self.stream.write("\r" + line + padding)
+            self.stream.flush()
+            self.last_line_len = len(line)
+            self.line_open = True
+        else:
+            bucket = percent // 10
+            if bucket > self.last_percent_bucket:
+                self.last_percent_bucket = bucket
+                self.stream.write("%s %d%% (%s/%s)\n" % (self.phase or "进度", percent,
+                                                         format_size(processed), format_size(total)))
+                self.stream.flush()
+
+    def finish(self):
+        """结束：收束进度行，保证后续输出/命令提示符不叠字。"""
+        self.close_line()
+
+
 def check_size_and_duration(size, duration_seconds):
     duration_minutes = duration_seconds / 60
     # 根据参考标准判断
@@ -1865,6 +1934,7 @@ class Steganographier:
         self.auto_rename_on_conflict        = False           # 解除隐写时遇到同名文件是否自动重命名
         self.auto_rename_hide_on_conflict   = False           # 隐写时遇到同名输出文件是否自动重命名
         self._reserved_hide_outputs         = set()           # 本批次已分配的隐写输出路径，防止同批次重复分配
+        self.cli_reporter                   = None            # CLI 进度渲染器（__main__ 在 CLI 模式安装）
 
     def init_log_file(self):
         """初始化日志文件"""
@@ -1957,12 +2027,22 @@ class Steganographier:
         
         # 控制台/GUI 显示
         if self.gui_enabled == False:   # CLI模式
-            # 在 CLI 模式下，不输出到控制台，只写文件
-            # 这样可以避免所有编码问题
-            pass
+            # v1.3.13 起回显到控制台（stdout 已在 __main__ 配置为 utf-8-sig）：
+            # 先收束进度行避免与实时进度叠字
+            reporter = getattr(self, "cli_reporter", None)
+            if reporter is not None:
+                reporter.close_line()
+                print(message)
+                sys.stdout.flush()
         else:                           # GUI模式
             if hasattr(self, 'log_callback') and self.log_callback:
                 self.log_callback(message)
+
+    def announce_phase(self, label):
+        """CLI 进度阶段标签（未安装渲染器时为 no-op）。"""
+        reporter = getattr(self, "cli_reporter", None)
+        if reporter is not None:
+            reporter.set_phase(label)
 
     def _resolve_conflict_path(self, output_file_path):
         """根据配置自动生成不冲突的输出路径"""
@@ -2123,6 +2203,7 @@ class Steganographier:
         return cover_video_path
         
     def compress_files(self, zip_file_path, input_file_path, processed_size=0, password=None):
+        self.announce_phase("压缩中")
         # 归一化输入路径：以分隔符结尾的目录路径（PowerShell 目录名补全的产物，
         # 例如 '.\WinX-WT-Takeover\'）会让 os.path.basename() 返回空串，
         # 导致 zip 注释、压缩包内 arcname 等全部错位。
@@ -2277,6 +2358,7 @@ class Steganographier:
         - 写模式加密走归档级 setpassword（pyzipper 的 open(pwd=…) 参数在写模式不生效）；
         - extra_entries: [(arcname, payload_bytes)]，如《合并说明.txt》。
         """
+        self.announce_phase("压缩中")
         total_size = sum(p["size"] if p["kind"] == "whole" else p["length"] for p in pieces)
         if extra_entries:
             total_size += sum(len(payload) for _arcname, payload in extra_entries)
@@ -2405,6 +2487,7 @@ class Steganographier:
         缩进与异常语义），仅进度回调改经 _report_progress 转发，便于分卷编排器
         按卷缩放进度。调用前置条件：self.type_option_var 已设置。
         """
+        self.announce_phase("隐写中")
         try:
             # 4.1. MP4文件隐写逻辑 - WinRAR版本
             if self.type_option_var == 'mp4':
@@ -2651,6 +2734,7 @@ class Steganographier:
         else:
             cmd += ["-mx=5"]
         cmd += [archive_path, input_file_path]
+        self.announce_phase("分卷打包中")
         self.log("正在生成真分卷: %s" % os.path.basename(archive_path))
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                    text=True, encoding="utf-8", errors="replace")
@@ -3018,6 +3102,7 @@ class Steganographier:
             self.auto_rename_on_conflict = auto_rename_on_conflict
 
         self.log(f"开始解除隐写: {input_file_path}")
+        self.announce_phase("解隐写中")
         self.log(f"指定模式: {type_option_var}")
 
         # 准备密码列表
@@ -4197,6 +4282,7 @@ class Steganographier:
         批量处理目录中的隐写文件进行解除隐写
         支持多种格式：MP4, MKV, MOV, M4V, WEBM等
         """
+        self.announce_phase("批量解隐写中")
         processed_count = 0
         success_count = 0
         
@@ -4400,8 +4486,13 @@ if __name__ == "__main__":
             version=version_info
         )
 
+        steganographier.cli_reporter = CliProgressReporter()
+        steganographier.progress_callback = steganographier.cli_reporter.update
         print(args)
-        steganographier.run_cli(args) # 调用run_cli方法
+        try:
+            steganographier.run_cli(args) # 调用run_cli方法
+        finally:
+            steganographier.cli_reporter.finish()
 
     else:
         print('GUI')

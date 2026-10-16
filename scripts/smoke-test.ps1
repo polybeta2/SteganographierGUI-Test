@@ -25,6 +25,7 @@ $requiredFiles = @(
     "modules\favicon.ico",
     "modules\PW.txt",
     "tools\7z.exe",
+    "tools\7z.dll",
     "tools\mkvmerge.exe",
     "tools\mkvextract.exe",
     "tools\mkvinfo.exe",

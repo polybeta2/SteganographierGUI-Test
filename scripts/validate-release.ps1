@@ -47,6 +47,7 @@ $requiredPaths = @(
     "installer/wizard-logo.png",
     "installer/wizard-small.png",
     "tools/7z.exe",
+    "tools/7z.dll",
     "tools/mkvmerge.exe",
     "tools/mkvextract.exe",
     "tools/mkvinfo.exe",

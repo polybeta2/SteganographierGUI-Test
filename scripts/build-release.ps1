@@ -89,7 +89,9 @@ VSVersionInfo(
     Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $portablePath -CompressionLevel Optimal
 
     if ($BuildInstaller) {
-        $isccCandidates = @(
+        $isccCandidates = @()
+        if ($env:ISCC_PATH) { $isccCandidates += $env:ISCC_PATH }
+        $isccCandidates += @(
             "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
             "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
         )

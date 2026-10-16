@@ -599,6 +599,17 @@ def plan_volumes(entries, volume_budgets, chunk_min_bytes=MIN_VOLUME_CAP_BYTES,
     return {"volumes": volumes, "chunked": chunked}
 
 
+def build_merge_note(chunked):
+    """为切块文件生成《合并说明.txt》内容（UTF-8 BOM 由写入方负责）。"""
+    lines = ["【大文件合并说明】",
+             "以下文件因为超过单卷上限被切成了多个片段，解压全部视频后请按顺序合并：", ""]
+    for original, parts in chunked.items():
+        commands = "+".join('"%s"' % part for part in parts)
+        lines.append('copy /b %s "%s"' % (commands, original))
+    lines += ["", "也可以用 7-Zip：选中第一个 .00N 片段 → 菜单「文件」→「合并文件」。"]
+    return "\n".join(lines) + "\n"
+
+
 def collect_input_entries(input_file_path, exclude_path, log=None):
     """收集 (full_path, arcname, size) 列表；exclude_path（正在写入的临时包）必须被排除。
 
@@ -2207,7 +2218,8 @@ class Steganographier:
                     report()
                 else:
                     zipinfo_cls = getattr(zip_file, "zipinfo_cls", zipfile.ZipInfo)
-                    zi = zipinfo_cls(piece["arcname"])
+                    # zip 内部条目名统一用 '/'（与 zipfile.write 的规范化行为一致）
+                    zi = zipinfo_cls(piece["arcname"].replace(os.sep, "/"))
                     zi.date_time = _random_zip_date_time()
                     zi.compress_type = zipfile.ZIP_STORED
                     zi.file_size = piece["length"]
@@ -2519,20 +2531,161 @@ class Steganographier:
             self.log(f"隐写时发生未预料的错误: {str(e)}")
             raise
 
+    def _volume_cover_candidates(self, cover_video_CLI, video_folder_path):
+        """分卷用的外壳候选序列：-c 指定则固定单件；否则按名称顺序取目录内全部 mp4。"""
+        if cover_video_CLI:
+            return [cover_video_CLI]
+        if not video_folder_path or not os.path.isdir(video_folder_path):
+            raise ValueError("找不到外壳视频目录: %s" % video_folder_path)
+        candidates = [os.path.join(video_folder_path, item)
+                      for item in natsorted([f for f in os.listdir(video_folder_path) if f.endswith(".mp4")],
+                                            alg=ns.PATH)]
+        if not candidates:
+            raise ValueError("%s 文件夹下没有可用的 MP4 外壳" % video_folder_path)
+        return candidates
+
+    def _hide_volumized_split(self, input_file_path, volume_cap_bytes, cover_candidates,
+                              budgets, processed_files, output_option,
+                              output_cover_video_name_mode, output_dir, password):
+        """真分卷模式的占位实现；方法体在后续任务替换为真实现在。"""
+        raise NotImplementedError("真分卷模式将在下一个任务实现")
+
+    def hide_volumized(self, input_file_path, volume_cap_bytes, password=None, processed_files=0,
+                       output_option=None, output_cover_video_name_mode=None, type_option_var=None,
+                       video_folder_path=None, cover_video_CLI=None, output_dir=None, volume_mode="zip"):
+        """自动分卷隐写入口：按上限把输入拆成多个卷，逐卷"压缩 → 隐写 → 清理"。
+
+        返回 {"volumes", "outputs", "chunked", "mode"}。
+        volume_mode: "zip"=每卷独立压缩包（默认）；"split"=真分卷（.zip.001）。
+        """
+        input_file_path = os.path.normpath(input_file_path)
+        self.type_option_var = type_option_var
+        if not output_option:
+            output_option = '原文件名'
+        self.output_option = output_option
+        self.output_cover_video_name_mode = output_cover_video_name_mode
+        self.password = password
+
+        if type_option_var == 'mp4(zarchiver)':
+            raise ValueError("mp4(zarchiver) 模式不支持自动分卷（大卷会把整包读入内存）")
+        if type_option_var == 'mkv' and volume_cap_bytes > 2 * 1024 ** 3:
+            self.log("mkv 模式每卷上限自动收敛到 2GB（原设置 %s）" % format_size(volume_cap_bytes))
+            volume_cap_bytes = 2 * 1024 ** 3
+
+        cover_candidates = self._volume_cover_candidates(cover_video_CLI, video_folder_path)
+        budgets = []
+        for cover in cover_candidates:
+            budget = volume_cap_bytes - os.path.getsize(cover) - VOLUME_SIZE_MARGIN_BYTES
+            if budget < MIN_VOLUME_CAP_BYTES:
+                raise ValueError("上限太小：扣除外壳「%s」与 1MB 余量后仅剩 %s，请调大上限"
+                                 % (os.path.basename(cover), format_size(max(budget, 0))))
+            budgets.append(budget)
+
+        entries = collect_input_entries(input_file_path, None, log=self.log)
+        if not entries:
+            raise ValueError("没有可隐写的文件")
+        random.shuffle(entries)
+
+        if volume_mode == "split":
+            return self._hide_volumized_split(input_file_path, volume_cap_bytes, cover_candidates,
+                                              budgets, processed_files, output_option,
+                                              output_cover_video_name_mode, output_dir, password)
+
+        plan = plan_volumes(entries, budgets, budget_offset=processed_files % len(budgets))
+        volumes = plan["volumes"]
+        total = len(volumes)
+        if total > 1 and len(cover_candidates) == 1:
+            self.log("提示：候选外壳只有 1 个，%d 个卷将重复使用同一外壳" % total)
+
+        if total == 1:
+            # 未发生分卷：走现有单卷路径（不加 ofN 后缀）
+            output_override = None
+            if output_dir:
+                output_override = self.get_output_file_path(
+                    input_file_path, None, processed_files, output_option,
+                    output_cover_video_name_mode, cover_candidates[0],
+                    output_directory=output_dir)
+            self.hide_file(input_file_path=input_file_path, cover_video_CLI=cover_video_CLI,
+                           password=password, processed_files=processed_files,
+                           output_file_path=output_override, output_option=output_option,
+                           output_cover_video_name_mode=output_cover_video_name_mode,
+                           type_option_var=type_option_var, video_folder_path=video_folder_path)
+            return {"volumes": 1, "outputs": [output_override] if output_override else [],
+                    "chunked": {}, "mode": "zip"}
+
+        note_by_volume = {}
+        if plan["chunked"]:
+            note_text = build_merge_note(plan["chunked"])
+            for first_part in (parts[0] for parts in plan["chunked"].values()):
+                for index, volume in enumerate(volumes):
+                    if any(p["kind"] == "chunk" and p["arcname"] == first_part for p in volume["pieces"]):
+                        note_by_volume[index] = note_text
+                        break
+
+        outputs = []
+        for index, volume in enumerate(volumes):
+            k = index + 1
+            cover = cover_candidates[(processed_files + index) % len(cover_candidates)]
+            output_file = self.get_output_file_path(
+                input_file_path, None, processed_files, output_option,
+                output_cover_video_name_mode, cover,
+                volume_index=k, volume_total=total, output_directory=output_dir)
+            temp_zip = build_temp_archive_path(input_file_path, processed_files + index)
+            extra_entries = []
+            if index in note_by_volume:
+                extra_entries.append(("合并说明.txt", note_by_volume[index].encode("utf-8-sig")))
+            volume_comment = ("Volume %d/%d of '%s'\nTimestamp '%s'"
+                              % (k, total, os.path.basename(input_file_path),
+                                 time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time()))))
+            self.log("第 %d/%d 卷：压缩中…" % (k, total))
+            try:
+                compress_progress = None
+                if self.progress_callback:
+                    compress_progress = lambda p, t, k=k: self.progress_callback(
+                        k - 1 + 0.5 * (p / t if t else 1.0), total)
+                self.compress_entry_list(temp_zip, volume["pieces"], password=password,
+                                         comment=volume_comment, extra_entries=extra_entries,
+                                         progress_callback=compress_progress)
+                self.log("第 %d/%d 卷：隐写中…" % (k, total))
+                embed_progress = None
+                if self.progress_callback:
+                    embed_progress = lambda frac, k=k: self.progress_callback(
+                        k - 1 + 0.5 + 0.5 * frac, total)
+                self._embed_zip_into_video(cover, temp_zip, output_file,
+                                           input_file_path=input_file_path,
+                                           progress_callback=embed_progress)
+                outputs.append(output_file)
+                self.log("第 %d/%d 卷：完成 -> %s" % (k, total, output_file))
+            finally:
+                try:
+                    os.remove(temp_zip)
+                except OSError as remove_error:
+                    self.log("删除临时zip文件失败: %s" % remove_error)
+
+        return {"volumes": total, "outputs": outputs, "chunked": plan["chunked"], "mode": "zip"}
+
     # 隐写时指定输出文件名+路径的方法
     def get_output_file_path(self, input_file_path=None, 
                             output_file_path=None, 
                             processed_files=0, 
                             output_option=None, 
                             output_cover_video_name_mode=None,
-                            cover_video_path=None):
+                            cover_video_path=None,
+                            volume_index=None,
+                            volume_total=None,
+                            output_directory=None):
         """
         输出文件路径生成方法，支持新的类型选项
+
+        volume_index/volume_total：分卷模式下使用 `_kofN` 后缀（否则沿用批次序号）；
+        output_directory：分卷模式的 -o 目录（输出文件落在此目录下）。
         """
 
         # 输出文件名指定
         if output_file_path:
             return output_file_path # 如果指定了输出文件名就用输出文件名（CLI模式）
+
+        number_text = ("%dof%d" % (volume_index, volume_total)) if volume_index else str(processed_files + 1)
 
         self.log(f'type option: {self.type_option_var}')
         
@@ -2545,16 +2698,16 @@ class Steganographier:
             self.log(f'output_option: {output_option}')
             if output_option == '原文件名':
                 if os.path.isdir(input_file_path):
-                    output_file_path = input_file_path + f"_hidden_{processed_files+1}.mp4" # 当为文件夹时不存在扩展名
+                    output_file_path = input_file_path + f"_hidden_{number_text}.mp4" # 当为文件夹时不存在扩展名
                 else:
-                    output_file_path = os.path.splitext(input_file_path)[0] + f"_hidden_{processed_files+1}.mp4"
+                    output_file_path = os.path.splitext(input_file_path)[0] + f"_hidden_{number_text}.mp4"
             elif output_option == '外壳文件名':
                 output_file_path = os.path.join(os.path.split(input_file_path)[0], 
-                                                os.path.split(cover_video_path)[1].replace('.mp4', f'_{processed_files+1}.mp4')
+                                                os.path.split(cover_video_path)[1].replace('.mp4', f'_{number_text}.mp4')
                                                 )
             elif output_option == '随机文件名':
                 output_file_path = os.path.join(os.path.split(input_file_path)[0], 
-                                        generate_random_filename(length=16) + f'_{processed_files+1}.mp4')
+                                        generate_random_filename(length=16) + f'_{number_text}.mp4')
             self.log(f"output_file_path: {output_file_path}")    
 
         elif self.type_option_var in ['mp4(zarchiver)']:
@@ -2565,16 +2718,16 @@ class Steganographier:
             self.log(f'output_option: {output_option}')
             if output_option == '原文件名':
                 if os.path.isdir(input_file_path):
-                    output_file_path = input_file_path + f"_hidden_z{processed_files+1}.mp4" # 当为文件夹时不存在扩展名
+                    output_file_path = input_file_path + f"_hidden_z{number_text}.mp4" # 当为文件夹时不存在扩展名
                 else:
-                    output_file_path = os.path.splitext(input_file_path)[0] + f"_hidden_z{processed_files+1}.mp4"
+                    output_file_path = os.path.splitext(input_file_path)[0] + f"_hidden_z{number_text}.mp4"
             elif output_option == '外壳文件名':
                 output_file_path = os.path.join(os.path.split(input_file_path)[0], 
-                                                os.path.split(cover_video_path)[1].replace('.mp4', f'_z{processed_files+1}.mp4')
+                                                os.path.split(cover_video_path)[1].replace('.mp4', f'_z{number_text}.mp4')
                                                 )
             elif output_option == '随机文件名':
                 output_file_path = os.path.join(os.path.split(input_file_path)[0], 
-                                        generate_random_filename(length=16) + f'_z{processed_files+1}.mp4')
+                                        generate_random_filename(length=16) + f'_z{number_text}.mp4')
             self.log(f"output_file_path2: {output_file_path}\n")   
         
         elif self.type_option_var == 'mkv':
@@ -2582,17 +2735,20 @@ class Steganographier:
             self.log(f'output_option: {output_option}')
             if output_option == '原文件名':
                 if os.path.isdir(input_file_path):
-                    output_file_path = input_file_path + f"_hidden_{processed_files+1}.mkv" # 当为文件夹时不存在扩展名
+                    output_file_path = input_file_path + f"_hidden_{number_text}.mkv" # 当为文件夹时不存在扩展名
                 else:
-                    output_file_path = os.path.splitext(input_file_path)[0] + f"_hidden_{processed_files+1}.mkv"
+                    output_file_path = os.path.splitext(input_file_path)[0] + f"_hidden_{number_text}.mkv"
             elif output_option == '外壳文件名':
                 output_file_path = os.path.join(os.path.split(input_file_path)[0], 
-                                                os.path.split(cover_video_path)[1].replace('.mp4', f'_{processed_files+1}.mkv')
+                                                os.path.split(cover_video_path)[1].replace('.mp4', f'_{number_text}.mkv')
                                                 )
             elif output_option == '随机文件名':
                 output_file_path = os.path.join(os.path.split(input_file_path)[0], 
-                                        generate_random_filename(length=16) + f'_{processed_files+1}.mkv')
+                                        generate_random_filename(length=16) + f'_{number_text}.mkv')
             self.log(f"output_file_path2: {output_file_path}")
+
+        if output_directory and output_file_path:
+            output_file_path = os.path.join(output_directory, os.path.basename(output_file_path))
 
         # 隐写输出与解除隐写共用同一套重名处理策略（issue #37）：开启自动改名时
         # 若目标路径已存在（或本批次已分配）则生成不冲突的路径，避免静默覆盖已有产物。
@@ -3685,6 +3841,42 @@ class Steganographier:
             
             # 处理单个文件
             if not args.reveal:
+                # 分卷隐写（--volume-size）
+                if args.volume_size is not None:
+                    try:
+                        cap_bytes = parse_size_to_bytes(args.volume_size)
+                    except ValueError as error:
+                        print("错误: %s" % error)
+                        sys.exit(1)
+                    output_dir = None
+                    if args.output:
+                        looks_like_file = os.path.splitext(args.output)[1] != '' and not os.path.isdir(args.output)
+                        if looks_like_file:
+                            print("分卷模式下 -o 需要是输出目录（例如 D:\\输出文件夹）")
+                            sys.exit(1)
+                        output_dir = args.output
+                        os.makedirs(output_dir, exist_ok=True)
+                    cover_candidates_dir = os.path.join(application_path, "cover_video")
+                    try:
+                        summary = self.hide_volumized(
+                            input_file_path=args.input, volume_cap_bytes=cap_bytes, password=args.password,
+                            processed_files=0, output_option='原文件名',
+                            output_cover_video_name_mode='===============名称顺序模式===============',
+                            type_option_var=args.type,
+                            video_folder_path=cover_candidates_dir,
+                            cover_video_CLI=args.cover, output_dir=output_dir, volume_mode=args.volume_mode)
+                    except ValueError as error:
+                        print("错误: %s" % error)
+                        sys.exit(1)
+                    print("分卷隐写完成：共 %d 个视频" % summary["volumes"])
+                    for path in summary["outputs"]:
+                        print("  - %s" % path)
+                    if summary["chunked"]:
+                        print("含切块文件（解压后需按《合并说明.txt》合并）：")
+                        for original in summary["chunked"]:
+                            print("  - %s" % original)
+                    return
+
                 # 检查 mkv 模式下文件大小是否超过 2GB
                 if args.type == 'mkv':
                     input_size = get_file_or_folder_size(args.input)
@@ -3889,7 +4081,8 @@ if __name__ == "__main__":
                           '-t', '--type', '-c', '--cover', '-r', '--reveal',
                           '-rd', '--reveal-dir', '-h', '--help',
                           '-pf', '--password-file', '-v', '--version',
-                          '--keep-original', '--auto-rename', '--no-log']
+                          '--keep-original', '--auto-rename', '--no-log',
+                          '-vs', '--volume-size', '--volume-mode']
     gui_flag_arguments = ['-rb', '--reveal-batch']
     is_cli_mode = (
         len(sys.argv) > 1
@@ -3928,9 +4121,19 @@ if __name__ == "__main__":
     parser.add_argument('--auto-rename', action='store_true', help='解除隐写遇到同名文件时自动改名')
     parser.add_argument('-pf', '--password-file', default=None, help='指定密码文件路径')
     parser.add_argument('--no-log', action='store_true', help='禁用日志文件')
+    parser.add_argument('-vs', '--volume-size', default=None,
+                        help='启用自动分卷：每个输出视频的上限（如 4G / 4096M / 512=MB）')
+    parser.add_argument('--volume-mode', choices=['zip', 'split'], default='zip',
+                        help='分卷方式: zip=每卷独立压缩包(默认), split=真分卷(.zip.001)')
     parser.add_argument('-v', '--version', action='version', version=f'隐写者版本: {version_info}', help='显示版本号并退出')
 
     args, unknown = parser.parse_known_args()
+
+    # 分卷参数校验
+    if args.volume_size is not None and (args.reveal or args.reveal_dir or args.reveal_batch):
+        parser.error("--volume-size 仅用于隐写，不能与解除隐写相关参数同时使用")
+    if args.volume_mode != 'zip' and args.volume_size is None:
+        parser.error("--volume-mode 需与 --volume-size 一起使用")
 
     # 如果请求帮助，直接打印并退出（避免继续进入 GUI）
     if getattr(args, 'help', False):
@@ -3971,41 +4174,43 @@ if __name__ == "__main__":
     if args.input:
         print('CLI')
         # 首先调整传入的参数
-        # 1. 处理输出路径
-        if args.output is None:
-            # 1.1 如果没有指定输出文件路径, 则默认和输入文件同路径, 使用原文件名+"_hidden.mp4/mkv"
-            input_dir = os.path.dirname(os.path.abspath(args.input))
-            args.output = os.path.join(input_dir, f"{os.path.splitext(os.path.basename(args.input))[0]}_hidden.{args.type}")
-        else:
-            # 1.2. 如果指定了输出路径但不包含文件名, 仍使用原文件名+"_hidden.mp4/mkv"
-            if os.path.splitext(args.output)[1] == '':
-                input_filename = os.path.splitext(os.path.basename(args.input))[0]
-                args.output = f"{os.path.join(args.output, input_filename)}_hidden.{args.type}"
-            # 1.3. 其余情况则使用指定的输出文件名
+        # 分卷模式下 -o/-c 由 run_cli 的分支按"输出目录 / 名称顺序轮换"语义处理，此处不做自动补全
+        if args.volume_size is None:
+            # 1. 处理输出路径
+            if args.output is None:
+                # 1.1 如果没有指定输出文件路径, 则默认和输入文件同路径, 使用原文件名+"_hidden.mp4/mkv"
+                input_dir = os.path.dirname(os.path.abspath(args.input))
+                args.output = os.path.join(input_dir, f"{os.path.splitext(os.path.basename(args.input))[0]}_hidden.{args.type}")
             else:
-                args.output = args.output
+                # 1.2. 如果指定了输出路径但不包含文件名, 仍使用原文件名+"_hidden.mp4/mkv"
+                if os.path.splitext(args.output)[1] == '':
+                    input_filename = os.path.splitext(os.path.basename(args.input))[0]
+                    args.output = f"{os.path.join(args.output, input_filename)}_hidden.{args.type}"
+                # 1.3. 其余情况则使用指定的输出文件名
+                else:
+                    args.output = args.output
 
-        # 2. 处理外壳MP4文件
-        if args.cover is None:
-            mp4list = []
-            # 2.1 如果没有指定外壳视频路径, 则自动在程序同路径下的 cover_video 文件夹中寻找第一个文件
-            cover_video_path = os.path.join(application_path, 'cover_video')
-            if os.path.exists(cover_video_path):
-                mp4list = [os.path.join(cover_video_path, item) for item in os.listdir(cover_video_path) if item.endswith('.mp4')]
-            
-            # 2.2 否则使用程序所在目录中的第一个mp4文件
-            mp4list += [os.path.join(application_path, item) for item in os.listdir(application_path) if item.endswith('.mp4')]  # 程序所在目录
-            
-            # 2.3 假如以上都没找到,那么就在输入文件/目录所在目录下寻找
-            if not mp4list:
-                input_dir = os.path.dirname(os.path.abspath(args.input))  # 获取输入文件/文件夹的父目录
-                mp4list += [os.path.join(input_dir, item) for item in os.listdir(input_dir) if item.endswith('.mp4')]  # 输入文件/目录所在目录
+            # 2. 处理外壳MP4文件
+            if args.cover is None:
+                mp4list = []
+                # 2.1 如果没有指定外壳视频路径, 则自动在程序同路径下的 cover_video 文件夹中寻找第一个文件
+                cover_video_path = os.path.join(application_path, 'cover_video')
+                if os.path.exists(cover_video_path):
+                    mp4list = [os.path.join(cover_video_path, item) for item in os.listdir(cover_video_path) if item.endswith('.mp4')]
+                
+                # 2.2 否则使用程序所在目录中的第一个mp4文件
+                mp4list += [os.path.join(application_path, item) for item in os.listdir(application_path) if item.endswith('.mp4')]  # 程序所在目录
+                
+                # 2.3 假如以上都没找到,那么就在输入文件/目录所在目录下寻找
+                if not mp4list:
+                    input_dir = os.path.dirname(os.path.abspath(args.input))  # 获取输入文件/文件夹的父目录
+                    mp4list += [os.path.join(input_dir, item) for item in os.listdir(input_dir) if item.endswith('.mp4')]  # 输入文件/目录所在目录
 
-            if mp4list:
-                args.cover = mp4list[0]
-            else:
-                print('请指定外壳MP4文件')
-                exit(1)  # 退出程序
+                if mp4list:
+                    args.cover = mp4list[0]
+                else:
+                    print('请指定外壳MP4文件')
+                    exit(1)  # 退出程序
 
         # 3. 处理密码文件
         if args.password_file is None:

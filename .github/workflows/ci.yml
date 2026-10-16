@@ -41,3 +41,5 @@ jobs:
           python .\scripts\test-cli-temp-archive.py
           python .\scripts\test-mp4-free-atom-format.py
           python .\scripts\test-reveal-keeps-original.py
+          python .\scripts\test-volume-plan.py
+          python .\scripts\test-volume-mode.py

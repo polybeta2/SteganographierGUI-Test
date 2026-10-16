@@ -17,7 +17,7 @@
 - **风格（AGENTS.md）**：4 空格缩进；`snake_case`/`PascalCase`/`UPPER_SNAKE_CASE`；保留 UTF-8 中文；改动用 `os.path` 而非手拼路径。
 - **依赖**：不新增第三方依赖。7z/mkvmerge 一律用 `tools/` 捆绑件（`self._7z_exe`）。
 - **变更范围**：只动 `Steganographier.py`、`scripts/`（新增测试）、`.github/workflows/ci.yml`、`README.md`、`CHANGELOG.md`、`VERSION`、`docs/superpowers/specs/2026-10-16-volume-hiding-design.md`（回填实测）。不动 `context-menu/`、`installer/`、`SteganographierGUI.spec`。
-- **开发环境**：`D:\SteganographierGUI` 克隆（main）+ 本地 `.venv`（Python 3.12，`C:\Python312\python.exe`）。pip 慢时加 `--proxy http://127.0.0.1:7890`。
+- **开发环境**：`D:\SteganographierGUI` 克隆 + 本地 `.venv`（uv 管理的 CPython 3.12.13：`C:\Users\polybeta\AppData\Roaming\uv\python\cpython-3.12.13-windows-x86_64-none\python.exe`）。pip 走 `--proxy http://127.0.0.1:7890`。
 - **执行许可**：运行测试、构建安装包前需征得用户同意（用户习惯）；GUI 界面验收由用户亲自操作。git 仅本地提交，不 push；需要网络时走 127.0.0.1:7890。
 - **提交信息**：短祈使句英文（仓库历史风格），每个提交单一关注点。
 
@@ -118,12 +118,31 @@ Expected: `7z t` 通过（说明 pyzipper `open(ZipInfo, 'w', pwd=...)` 可流�
 ```
 记录 stdout 中百分比行的格式（供 `_create_split_archive_with_7z` 解析）。
 
-- [ ] **Step 7: 回填设计文档并提交**
+- [ ] **Step 7: 修复缺失的 7z.dll（spike 发现的上游缺陷，用户已批准入库）**
 
-把 Step 3–6 结论写入 spec 的 §15（改为"已实测"）与 §12 的 WinRAR 行；若参数组合与设计假设不同（如 AES 需不同写法），同步修正 §5 的生成命令描述。
+Spike 发现 `tools/7z.exe`（官方 23.01 x64 控制台版）依赖 `tools/7z.dll`，但该 DLL 自 v1.3.10 起从未入库——7z.exe 的 `l/x/a` 全部失败（现有"7-Zip 优先解压"一直静默降级）。修复步骤（已完成）：
 
 ```bash
-git add docs/superpowers/specs/2026-10-16-volume-hiding-design.md
+# 1) 下载官方 MSI（走代理）并管理式解包
+curl -sL -x http://127.0.0.1:7890 -o /tmp/7ztest/7z2301-x64.msi https://www.7-zip.org/a/7z2301-x64.msi
+powershell.exe -NoProfile -Command "Start-Process msiexec.exe -ArgumentList '/a','C:\\...\\7z2301-x64.msi','/qn','TARGETDIR=C:\\...\\msi_out' -Wait"
+# 2) 复制官方 7z.dll 入仓库（SHA-256 应为 77222e81cb7004e8c3e077aada02b555a3d38fb05b50c64afd36ca230a8fd5b9）
+cp msi_out/Files/7-Zip/7z.dll tools/7z.dll
+```
+
+随后在 `scripts/validate-release.ps1` 的 `$requiredPaths` 与 `scripts/smoke-test.ps1` 的必需文件清单中，`tools/7z.exe` 之后各加一行 `"tools/7z.dll"` / `"tools\7z.dll"`。
+
+```bash
+git add tools/7z.dll scripts/validate-release.ps1 scripts/smoke-test.ps1
+git commit -m "Restore missing 7z.dll required by the bundled 7-Zip console binary"
+```
+
+- [ ] **Step 8: 回填设计文档与计划并提交**
+
+把 Step 3–6 结论与 7z.dll 修复写入 spec 的 §15（已实测）与 §12 的 WinRAR 行；同步修正 §5 生成命令描述；更新本计划 Task 4 的 pyzipper 调用写法（写模式用 `setpassword` + `zipinfo_cls`，`open` 的 `pwd` 参数不生效）与 Task 9 的 CHANGELOG 草稿（补记 7z.dll 缺陷修复）。
+
+```bash
+git add docs/superpowers/specs/2026-10-16-volume-hiding-design.md docs/superpowers/plans/2026-10-16-volume-hiding.md
 git commit -m "Record day-one verification results for the volume-splitting design"
 ```
 
@@ -561,11 +580,13 @@ def collect_input_entries(input_file_path, exclude_path, log=None):
                     processed_size += piece["size"]
                     report()
                 else:
-                    zi = zipfile.ZipInfo(filename=piece["arcname"], date_time=_random_zip_date_time())
+                    # 写模式加密走归档级 setpassword：pyzipper 的 open(pwd=…) 参数在写模式不生效
+                    zipinfo_cls = getattr(zip_file, "zipinfo_cls", zipfile.ZipInfo)
+                    zi = zipinfo_cls(piece["arcname"])
+                    zi.date_time = _random_zip_date_time()
                     zi.compress_type = zipfile.ZIP_STORED
-                    writer = (zip_file.open(zi, "w", pwd=password.encode("utf-8"))
-                              if password else zip_file.open(zi, "w"))
-                    with writer:
+                    zi.file_size = piece["length"]
+                    with zip_file.open(zi, "w") as writer:
                         with open(piece["path"], "rb") as source:
                             source.seek(piece["offset"])
                             remaining = piece["length"]
@@ -578,13 +599,13 @@ def collect_input_entries(input_file_path, exclude_path, log=None):
                                 processed_size += len(chunk)
                                 report()
             for arcname, payload in (extra_entries or []):
-                zi = zipfile.ZipInfo(filename=arcname, date_time=_random_zip_date_time())
+                zipinfo_cls = getattr(zip_file, "zipinfo_cls", zipfile.ZipInfo)
+                zi = zipinfo_cls(arcname)
+                zi.date_time = _random_zip_date_time()
                 zi.compress_type = zipfile.ZIP_DEFLATED
-                if password:
-                    with zip_file.open(zi, "w", pwd=password.encode("utf-8")) as writer:
-                        writer.write(payload)
-                else:
-                    zip_file.writestr(zi, payload)
+                zi.file_size = len(payload)
+                with zip_file.open(zi, "w") as writer:
+                    writer.write(payload)
                 processed_size += len(payload)
                 report()
             if comment:
@@ -606,7 +627,7 @@ def _random_zip_date_time():
             continue
 ```
 
-备注（spike 回退）：若 Task 1 Step 5 判定 pyzipper 流式写不可用，则 chunk 分支改为"先按 4MB 块把片段写到 `tempfile` 临时文件，再 `zip_file.write(tmp, arcname)`，随后删除临时文件"；此回退只影响本函数。
+备注（spike 已实测，2026-10-16）：pyzipper 流式写的正确姿势是 `setpassword(...)` + `zipinfo_cls(...)` + `open(zi, "w")`；`open` 的 `pwd` 参数在写模式不生效（Task 1 已验证 AES 条目可被 7z 完整解出）。无需临时文件回退方案。
 
 - [ ] **Step 4: 回归验证**
 
@@ -1510,6 +1531,9 @@ git commit -m "Wire automatic volume splitting into the GUI with config persiste
   - 两种方式可选：独立压缩包（每卷可单独解压，默认）／真分卷 `.zip.001`（7-Zip/Bandizip/新版 WinRAR 一次合并解压）。
   - 超大单文件在独立压缩包方式下自动按 `.001` 惯例切块，并附《合并说明.txt》。
   - GUI 新增「自动分卷 / 每卷上限 / 方式」控件（配置持久化）；CLI 新增 `--volume-size`、`--volume-mode`。
+
+### 缺陷修复
+- 补上缺失的 `tools\7z.dll`（官方 23.01 x64，SHA-256 `77222e81…`）：自 v1.3.10 起打包的 7-Zip 控制台二进制因缺 DLL 完全不可用，"7-Zip 优先解压"一直在静默降级到慢速方案；现已修复，并把 7z.dll 纳入 `validate-release.ps1` 与 `smoke-test.ps1` 的必需文件清单。
 ```
 
 - [ ] **Step 3: 全量测试（获用户同意后执行）**
